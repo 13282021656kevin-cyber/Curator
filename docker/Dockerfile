@@ -61,6 +61,21 @@ ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy
 RUN uv venv ${UV_PROJECT_ENVIRONMENT} --python /usr/bin/python3.13 --system-site-packages --seed
 
+# cosmos-xenna (vendored submodule) is a maturin/pyo3 (Rust) package with Cargo
+# edition 2024, which requires Rust >= 1.85. Install rustup stable + the C linker
+# used to build the extension module.
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo
+ENV PATH="/opt/cargo/bin:$PATH"
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential patchelf && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain stable --profile minimal
+# Override the /usr/bin/python3.12 hardcoded in cosmos-xenna/.cargo/config.toml:
+# this image ships python3.13, and the abi3-py312 wheel builds fine against 3.13.
+# A shell env var takes precedence over cargo's [env] table (not marked force).
+ENV PYO3_PYTHON=/opt/venv/bin/python
+
 FROM build AS nemo_curator_dep
 
 # Install etcd + nats-server (required by the Dynamo inference backend)
@@ -74,6 +89,12 @@ RUN bash install_haproxy.sh && \
     rm install_haproxy.sh
 ENV RAY_SERVE_HAPROXY_BINARY_PATH=/usr/local/bin/haproxy
 
+# Install FFmpeg with NVENC/NVDEC and software H.264/HEVC/AV1 decoding.
+# Also enable libopenh264 so H.264 software encoding is available by default.
+COPY docker/common/install_h264_support.sh .
+RUN bash install_h264_support.sh --with-libopenh264 && \
+    rm install_h264_support.sh
+
 
 FROM nemo_curator_dep AS nemo_curator
 
@@ -84,6 +105,10 @@ WORKDIR /opt/Curator
 # Selective file copying before dependency installation for better layer caching
 COPY pyproject.toml uv.lock /opt/Curator/
 COPY nemo_curator/__init__.py nemo_curator/package_info.py /opt/Curator/nemo_curator/
+# cosmos-xenna is an editable path dependency (vendored submodule); `uv sync --locked`
+# builds it from source via maturin, so its full source (Rust src/ + Cargo.* + Python
+# package) must be present before the sync. This layer only busts when the submodule changes.
+COPY cosmos-xenna/ /opt/Curator/cosmos-xenna/
 
 # Install Curator
 RUN if [ -n "${CURATOR_EXTRA}" ]; then \
